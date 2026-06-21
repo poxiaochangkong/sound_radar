@@ -66,6 +66,7 @@ class AppConfig:
 # ---- Hardcoded defaults (lowest priority; COMPLETE fallback) ----------------
 # Every field required by _build_app_config is present here so the app runs
 # even if config.yaml and any profile are both missing.
+# Values match config.yaml exactly (see commit history for tuning rationale).
 
 _HARD_DEFAULTS = {
     "audio": {
@@ -88,11 +89,11 @@ _HARD_DEFAULTS = {
         },
     },
     "direction": {
-        "snr_threshold_db": 12.0,
+        "snr_threshold_db": 8.0,
         "ignore_center_channel": True,
     },
     "onset": {
-        "flux_multiplier": 3.0,
+        "flux_multiplier": 2.5,
         "refractory_ms": 120,
     },
     "tracking": {
@@ -160,7 +161,7 @@ def load_config(path: Optional[str] = "config.yaml",
                 profile_path: Optional[str] = None) -> AppConfig:
     """Load and validate configuration.
 
-    Priority: profile > config.yaml (if it exists) > hardcoded defaults.
+    Priority: profile > config.yaml (if exists) > hardcoded defaults.
     If `path` is None or the file is missing, only the hardcoded defaults
     (plus an optional profile) are used — the app still runs.
     Raises ConfigError on any invalid value.

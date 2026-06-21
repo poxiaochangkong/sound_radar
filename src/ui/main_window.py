@@ -204,13 +204,16 @@ class MainWindow(QMainWindow):
         channel_energy = compute_channel_energy(frame.samples)
         band_energy = compute_band_energy(frame.samples, sample_rate)
 
-        # 2. Noise floor.
+        # 2. Onset detection FIRST (before noise floor update), so that if an
+        #    onset is detected we can FREEZE the noise floor for this frame
+        #    and prevent the transient from polluting the estimate.
+        onset_event = self._onset.process(frame, band_energy)
+        if onset_event is not None:
+            # Skip the noise-floor update for this transient frame.
+            self._noise_floor.freeze()
         noise_floor = self._noise_floor.update(channel_energy)
 
-        # 3. Onset detection (event gating).
-        onset_event = self._onset.process(frame, band_energy)
-
-        # 4. Direction estimation.
+        # 3. Direction estimation (only on onset frames).
         estimate = None
         if onset_event is not None:
             estimate = estimate_direction(
@@ -222,7 +225,7 @@ class MainWindow(QMainWindow):
                 timestamp=onset_event.timestamp,
             )
 
-        # 5. Smoother (decay + merge/create).
+        # 4. Smoother (decay + merge/create).
         return self._smoother.update(estimate)
 
     def _push_contacts(self, contacts) -> None:

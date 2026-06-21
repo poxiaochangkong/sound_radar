@@ -7,10 +7,10 @@
 # ============================================================
 
 audio:
-  # Source device: null = system default rendering device (WASAPI loopback).
-  # To use VoiceMeeter: set its exact name (case-insensitive substring match).
-  # Use `python src/main.py --list-devices` to find the exact name.
-  # Your environment shows: "Voicemeeter Input (VB-Audio Voicemeeter VAIO)" (8ch)
+  # Source device: null = system default render loopback.
+  # To use VoiceMeeter: set its name (case-insensitive substring match
+  # against the loopback device name). Run `python src/main.py --list-devices`
+  # to see exact names. Your environment: "Voicemeeter Input ... [Loopback]"
   device: "Voicemeeter Input"
   sample_rate: 48000          # Hz. Most FPS games output 48kHz.
   frame_size: 1024            # samples per channel per frame (~21ms @48k)
@@ -45,7 +45,9 @@ direction:
   # Minimum signal-to-noise ratio (dB) above noise floor to be considered an event.
   # Adaptive: noise floor is estimated online.
   # This is the BASE value at slider=50; the UI slider scales it in real time.
-  snr_threshold_db: 12.0
+  # Tuned down from 12.0 to 8.0: real game transients often have SNR 8-15 dB
+  # above the ambient mix, and 12 dB was too strict (caused missed detections).
+  snr_threshold_db: 8.0
 
   # If true, ignore the center channel when localizing.
   # Rationale: many FPS games mix non-positional UI/ambient sounds to center,
@@ -57,7 +59,8 @@ onset:
   # Spectral flux threshold for detecting a transient event.
   # Adaptive: this is a *multiplier* on the median spectral flux, not an absolute value.
   # This is the BASE value at slider=50; the UI slider scales it in real time.
-  flux_multiplier: 3.0
+  # Tuned down from 3.0 to 2.5: 3.0 missed many real footsteps/gunshots.
+  flux_multiplier: 2.5
 
   # Minimum refractory time between two events in the SAME band (ms).
   # Per-band: an onset in the high band does not suppress a near-simultaneous

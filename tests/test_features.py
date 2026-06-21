@@ -50,6 +50,8 @@ def test_noise_floor_tracks_quiet_input():
 
 
 def test_noise_floor_resists_brief_transient():
+    # With the new slow attack (2000 ms), a single loud frame must NOT drag
+    # the noise floor anywhere close to the loud value.
     nf = NoiseFloorEstimator(n_channels=1, sample_rate=48000, frame_size=1024)
     quiet = np.array([1e-7], dtype=np.float64)
     # Warm up with quiet.
@@ -59,12 +61,33 @@ def test_noise_floor_resists_brief_transient():
     # One loud transient frame.
     nf.update(np.array([1.0], dtype=np.float64))
     after_transient = nf.estimate[0]
-    # Should rise only modestly (attack is fast but a single frame is small).
+    # Should rise only very slightly (attack is now extremely slow).
     assert after_transient > before
-    assert after_transient < 0.5   # not dragged all the way to 1.0 in one frame
+    # Single frame must NOT move the estimate anywhere near 1.0.
+    # With attack=2000ms and frame~21ms, alpha ~= 0.01, so one frame moves
+    # the estimate by ~1% of (1.0 - before) ~ 0.01. Allow generous headroom.
+    assert after_transient < 0.05, f"noise floor jumped to {after_transient}"
     # Back to quiet: should decay (slowly) but not increase.
     nf.update(quiet)
     assert nf.estimate[0] <= after_transient
+
+
+def test_noise_floor_freeze_skips_update():
+    # freeze() must make the next update() a no-op.
+    nf = NoiseFloorEstimator(n_channels=1, sample_rate=48000, frame_size=1024)
+    quiet = np.array([1e-7], dtype=np.float64)
+    for _ in range(100):
+        nf.update(quiet)
+    before = nf.estimate[0]
+    nf.freeze()
+    # Feed a loud frame while frozen.
+    out = nf.update(np.array([1.0], dtype=np.float64))
+    # Estimate must be unchanged.
+    assert abs(out[0] - before) < 1e-15
+    assert abs(nf.estimate[0] - before) < 1e-15
+    # The NEXT frame (not frozen) should update normally.
+    nf.update(quiet)
+    assert nf.estimate[0] != before
 
 
 def test_noise_floor_floor_enforced():
