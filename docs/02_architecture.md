@@ -44,7 +44,7 @@
                         │ AudioFrame (multichannel PCM)
 ┌───────────────────────▼───────────────────────────┐
 │                 Audio Layer                        │
-│   capture.py  (WASAPI loopback via sounddevice)   │
+│   capture.py  (WASAPI loopback via PyAudioWPatch)   │
 │   framing.py  (ring buffer, windowing)            │
 └───────────────────────────────────────────────────┘
 ```

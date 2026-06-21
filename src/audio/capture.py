@@ -1,16 +1,36 @@
 """
-Multichannel WASAPI loopback capture.
+Multichannel WASAPI loopback capture via PyAudioWPatch.
+
+Why PyAudioWPatch (not `sounddevice`):
+  `sounddevice` >= 0.5 removed WASAPI loopback support
+  (`WasapiSettings(loopback=True)` was deleted). PyAudioWPatch (a PyAudio
+  fork) instead exposes each render device's loopback as a separate *virtual
+  input device* whose name ends with "[Loopback]". We open that virtual
+  input device like a normal InputStream, and we get the device's output
+  mix as PCM. Stable across versions.
+
+Note on host API:
+  PyAudioWPatch registers the loopback virtual devices under the MME host
+  API (hostApi id == paMME == 2), NOT under paWASAPI (13). This is fine —
+  PortAudio still talks to WASAPI under the hood. We therefore do NOT
+  filter loopback devices by host API; we filter by `isLoopbackDevice`.
 
 Design notes:
-  - The audio callback runs on the PortAudio real-time thread. It MUST NOT
-    block, allocate, or call numpy DSP. It only converts the incoming buffer
-    to float32 and pushes a copy onto a thread-safe queue.
-  - The processing thread consumes the queue. See docs/02_architecture.md
-    section 4 (thread model).
-  - We open the stream in WASAPI shared mode with loopback=True. On start()
-    we verify that the device actually supports the configured channel count
-    and report a clear, actionable error if not (see docs/06_calibration.md
-    section 4 — multichannel self-check).
+  - The audio callback runs on PortAudio's real-time thread. It MUST NOT
+    block, allocate, or call numpy DSP. It only copies the incoming buffer
+    to float32 and pushes a snapshot onto a thread-safe queue.
+  - The processing thread consumes the queue (see docs/02_architecture.md
+    section 4, thread model).
+  - On start() we verify that the loopback device advertises enough input
+    channels for the configured layout and raise a clear error if not
+    (docs/06_calibration.md section 4 — multichannel self-check).
+
+Public API is identical to the previous sounddevice-based implementation:
+  AudioCapture(device, sample_rate, frame_size, channel_layout, on_frame)
+    .start() / .stop() / .preflight_device()
+     .channel_names / .actual_channels / .actual_sample_rate
+  AudioCapture.list_devices()
+  make_drop_on_full_queue(maxsize) -> (queue, put_fn, dropped_count_fn)
 
 See docs/03_module_io.md section 1.1 for the contract.
 """
@@ -24,7 +44,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import numpy as np
-import sounddevice as sd
+import pyaudiowpatch as pyaudio
 
 from src.models import AudioFrame
 
@@ -47,35 +67,46 @@ class DeviceInfo:
     index: int
     name: str
     host_api: str
-    max_output_channels: int
+    max_output_channels: int   # for loopback devices, this holds maxInputChannels
     default_sample_rate: float
+    is_loopback: bool = False
 
     def __str__(self) -> str:
-        return f"[{self.index}] {self.name} ({self.host_api}, {self.max_output_channels}ch)"
+        # PyAudioWPatch already appends " [Loopback]" to the device name, so
+        # don't append it again in the display string.
+        return (f"[{self.index}] {self.name} "
+                f"({self.host_api}, in={self.max_output_channels}ch)")
 
 
-def _query_hostapis() -> List[dict]:
-    """Return the list of host APIs. Compatible with sounddevice >= 0.5."""
-    if hasattr(sd, "query_hostapis"):
-        return list(sd.query_hostapis())
-    apis = []
-    count = sd.query_hostapi_count()
-    for i in range(count):
-        apis.append(sd.query_hostapi(i))
-    return apis
+def _pyaudio_host_api_name(host_api_type_id: int) -> str:
+    """Map PortAudio host-api type id to a friendly name."""
+    mapping = {
+        pyaudio.paMME: "MME",
+        pyaudio.paDirectSound: "Windows DirectSound",
+        pyaudio.paWASAPI: "Windows WASAPI",
+        pyaudio.paWDMKS: "Windows WDM-KS",
+    }
+    return mapping.get(host_api_type_id, f"api#{host_api_type_id}")
 
 
-def _find_hostapi(name: str) -> dict:
-    apis = {a["name"]: a for a in _query_hostapis()}
-    if name not in apis:
-        raise AudioDeviceError(
-            f"Host API '{name}' not found. Available: {list(apis.keys())}"
-        )
-    return apis[name]
+def _info_to_loopback_device_info(info: dict) -> DeviceInfo:
+    """Build a DeviceInfo from a PyAudioWPatch loopback device dict."""
+    return DeviceInfo(
+        index=int(info["index"]),
+        name=str(info["name"]),
+        host_api=_pyaudio_host_api_name(int(info.get("hostApi", -1))),
+        # For loopback devices, the readable channel count is maxInputChannels.
+        max_output_channels=int(info["maxInputChannels"]),
+        default_sample_rate=float(info["defaultSampleRate"]),
+        is_loopback=True,
+    )
 
 
 class AudioCapture:
-    """Captures multichannel PCM from a WASAPI loopback device."""
+    """Captures multichannel PCM from a WASAPI loopback device.
+
+    Public contract is identical to the previous sounddevice-based version.
+    """
 
     def __init__(
         self,
@@ -95,7 +126,8 @@ class AudioCapture:
         self._channel_names = list(_CHANNEL_ORDER[channel_layout])
         self._on_frame = on_frame
 
-        self._stream: Optional[sd.InputStream] = None
+        self._pa: Optional[pyaudio.PyAudio] = None
+        self._stream = None
         self._actual_channels: Optional[int] = None
         self._actual_sample_rate: Optional[float] = None
         self._lock = threading.Lock()
@@ -103,43 +135,48 @@ class AudioCapture:
     # ---- introspection ----------------------------------------------------
 
     @staticmethod
-    def list_devices(host_api: str = "Windows WASAPI") -> List[DeviceInfo]:
-        """List output devices for the given host API (default: WASAPI)."""
-        api = _find_hostapi(host_api)
-        out: List[DeviceInfo] = []
-        for dev_idx in api["devices"]:
-            info = sd.query_devices(dev_idx)
-            out.append(DeviceInfo(
-                index=dev_idx,
-                name=info["name"],
-                host_api=host_api,
-                max_output_channels=info["max_output_channels"],
-                default_sample_rate=info["default_samplerate"],
-            ))
-        return out
+    def list_devices(host_api: Optional[str] = None) -> List[DeviceInfo]:
+        """List loopback devices.
+
+        `host_api` is accepted for backward compatibility but is NOT used to
+        filter, because PyAudioWPatch registers loopback devices under MME
+        regardless of the underlying API. We filter purely by
+        `isLoopbackDevice`.
+        """
+        pa = pyaudio.PyAudio()
+        try:
+            out: List[DeviceInfo] = []
+            for i in range(pa.get_device_count()):
+                try:
+                    info = pa.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                if not info.get("isLoopbackDevice", False):
+                    continue
+                out.append(_info_to_loopback_device_info(info))
+            return out
+        finally:
+            pa.terminate()
 
     def preflight_device(self) -> DeviceInfo:
-        """Resolve and return the device that will be used, WITHOUT opening it.
+        """Resolve and return the loopback device WITHOUT opening a stream.
 
-        Raises AudioDeviceError if the device cannot be resolved or does not
-        advertise enough output channels for the configured layout.
+        Raises AudioDeviceError if the device cannot be resolved or its
+        loopback input channel count is below the configured layout.
         """
-        device_idx = self._resolve_device_index(self._device_query)
-        info = sd.query_devices(device_idx)
-        dev = DeviceInfo(
-            index=device_idx,
-            name=info["name"],
-            host_api="Windows WASAPI",
-            max_output_channels=info["max_output_channels"],
-            default_sample_rate=info["default_samplerate"],
-        )
+        pa = pyaudio.PyAudio()
+        try:
+            dev_idx, info = self._resolve_loopback_device(pa, self._device_query)
+        finally:
+            pa.terminate()
+        dev = _info_to_loopback_device_info(info)
         if dev.max_output_channels < self._expected_channels:
             raise AudioDeviceError(
-                f"Device '{dev.name}' advertises only {dev.max_output_channels} "
-                f"output channels, but layout '{self._channel_layout}' requires "
-                f"{self._expected_channels}. Configure the Windows default device "
-                f"to {self._channel_layout} (or use a virtual 7.1 device like "
-                f"VoiceMeeter)."
+                f"Loopback device '{dev.name}' advertises only "
+                f"{dev.max_output_channels} input channels, but layout "
+                f"'{self._channel_layout}' requires {self._expected_channels}. "
+                f"Configure the Windows default device to {self._channel_layout} "
+                f"(or use a virtual 7.1 device like VoiceMeeter)."
             )
         return dev
 
@@ -148,51 +185,62 @@ class AudioCapture:
     def start(self) -> None:
         """Open and start the loopback stream. Raises AudioDeviceError on failure.
 
-        Performs the multichannel self-check from docs/06_calibration.md section 4:
-        verifies device channel count BEFORE opening and verifies the opened
-        stream's channel count AFTER opening.
+        Performs the multichannel self-check from docs/06_calibration.md section 4.
         """
         with self._lock:
             if self._stream is not None:
                 raise AudioDeviceError("Capture already started")
 
-            # Pre-open check: device must advertise enough output channels.
-            device_idx = self._resolve_device_index(self._device_query)
-            dev_info = sd.query_devices(device_idx)
-            if dev_info["max_output_channels"] < self._expected_channels:
+            self._pa = pyaudio.PyAudio()
+            try:
+                dev_idx, dev_info = self._resolve_loopback_device(self._pa, self._device_query)
+            except AudioDeviceError:
+                self._pa.terminate()
+                self._pa = None
+                raise
+
+            ch_in = int(dev_info["maxInputChannels"])
+            if ch_in < self._expected_channels:
+                self._pa.terminate()
+                self._pa = None
                 raise AudioDeviceError(
-                    f"Device '{dev_info['name']}' advertises only "
-                    f"{dev_info['max_output_channels']} output channels, but "
-                    f"layout '{self._channel_layout}' requires "
+                    f"Loopback device '{dev_info['name']}' advertises only "
+                    f"{ch_in} input channels, but layout "
+                    f"'{self._channel_layout}' requires "
                     f"{self._expected_channels}. Configure the Windows default "
                     f"device to {self._channel_layout} (Sound Settings → "
                     f"Device properties → Additional device properties → "
                     f"Configure → 7.1 Surround)."
                 )
 
+            device_rate = int(dev_info["defaultSampleRate"])
             try:
-                stream = sd.InputStream(
-                    device=device_idx,
-                    samplerate=self._sample_rate,
-                    blocksize=self._frame_size,
+                stream = self._pa.open(
+                    format=pyaudio.paFloat32,
                     channels=self._expected_channels,
-                    dtype="float32",
-                    latency="low",
-                    extra_settings=sd.WasapiSettings(loopback=True),
-                    callback=self._portaudio_callback,
+                    rate=device_rate,
+                    input=True,
+                    input_device_index=dev_idx,
+                    frames_per_buffer=self._frame_size,
+                    stream_callback=self._portaudio_callback,
                 )
-                stream.start()
+                stream.start_stream()
             except Exception as e:
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+                self._pa = None
                 raise AudioDeviceError(
                     f"Failed to open loopback stream on device "
-                    f"{device_idx!r} ({dev_info['name']}): {e}\n"
-                    f"Hint: confirm Windows default output is set to a "
-                    f"{self._channel_layout} device."
+                    f"{dev_idx!r} ({dev_info['name']}): {e}\n"
+                    f"Hint: confirm the loopback device is a "
+                    f"{self._channel_layout} output."
                 ) from e
 
             self._stream = stream
             self._actual_channels = self._expected_channels
-            self._actual_sample_rate = stream.samplerate
+            self._actual_sample_rate = float(device_rate)
             logger.info(
                 "WASAPI loopback opened: device='%s' %sch @ %sHz",
                 dev_info["name"], self._actual_channels, self._actual_sample_rate,
@@ -202,53 +250,85 @@ class AudioCapture:
         """Stop and close the stream. Safe to call multiple times."""
         with self._lock:
             stream = self._stream
+            pa = self._pa
             self._stream = None
+            self._pa = None
         if stream is not None:
             try:
-                stream.stop()
+                if stream.is_active():
+                    stream.stop_stream()
             except Exception as e:
                 logger.warning("error stopping stream: %s", e)
             try:
                 stream.close()
             except Exception as e:
                 logger.warning("error closing stream: %s", e)
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception as e:
+                logger.warning("error terminating PyAudio: %s", e)
 
     # ---- helpers ----------------------------------------------------------
 
-    def _resolve_device_index(self, query: Optional[str]) -> int:
-        """Find a WASAPI output device whose name contains `query`.
+    def _resolve_loopback_device(self, pa: pyaudio.PyAudio,
+                                  query: Optional[str]) -> tuple:
+        """Find a loopback device matching `query`.
 
-        If `query` is None, returns the WASAPI default output device.
+        If `query` is None, returns the default render device's loopback
+        (via PyAudioWPatch's get_default_wasapi_loopback()).
+        Otherwise matches by case-insensitive substring against the loopback
+        device name (which includes the [Loopback] suffix).
         """
-        wasapi = _find_hostapi("Windows WASAPI")
-
         if query is None:
-            default_out = wasapi["default_output_device"]
-            if default_out < 0:
+            try:
+                default_loop = pa.get_default_wasapi_loopback()
+            except Exception as e:
                 raise AudioDeviceError(
-                    "No default WASAPI output device is configured in Windows."
+                    f"No default WASAPI loopback device available: {e}"
                 )
-            return int(default_out)
+            return int(default_loop["index"]), default_loop
 
-        # Match by substring, case-insensitive.
-        for dev_idx in wasapi["devices"]:
-            name = sd.query_devices(dev_idx)["name"]
-            if query.lower() in name.lower():
-                return int(dev_idx)
+        q = query.lower()
+        # Match by substring against loopback device names.
+        for i in range(pa.get_device_count()):
+            try:
+                info = pa.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if not info.get("isLoopbackDevice", False):
+                continue
+            name = str(info["name"]).lower()
+            if q in name:
+                return int(i), info
+
+        # Helpful error: show available loopback devices.
+        names = []
+        for i in range(pa.get_device_count()):
+            try:
+                info = pa.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if info.get("isLoopbackDevice", False):
+                names.append(f"{info['name']} (in={info['maxInputChannels']}ch)")
         raise AudioDeviceError(
-            f"No WASAPI output device name matches '{query}'. "
-            f"Available: " + ", ".join(
-                sd.query_devices(i)["name"] for i in wasapi["devices"]
-            )
+            f"No loopback device name matches '{query}'. "
+            f"Available loopback devices: " + ", ".join(names)
         )
 
     # ---- real-time callback ----------------------------------------------
 
-    def _portaudio_callback(self, indata: np.ndarray, frames: int,
-                            time_info, status) -> None:
+    def _portaudio_callback(self, in_data: bytes, frame_count: int,
+                             time_info, status) -> tuple:
         """Called by PortAudio on the audio thread. MUST NOT block."""
         try:
-            samples = np.ascontiguousarray(indata, dtype=np.float32)
+            # in_data is interleaved float32 bytes; reshape without copy where
+            # possible. ascontiguousarray + frombuffer keeps it cheap.
+            samples = np.frombuffer(in_data, dtype=np.float32).reshape(
+                frame_count, self._expected_channels
+            )
+            # Defensive copy: PortAudio reuses the buffer after we return.
+            samples = np.ascontiguousarray(samples, dtype=np.float32)
             frame = AudioFrame(
                 samples=samples,
                 sample_rate=int(self._actual_sample_rate or self._sample_rate),
@@ -256,11 +336,10 @@ class AudioCapture:
                 channel_names=list(self._channel_names),
             )
             self._on_frame(frame)
-        except Exception as e:
+        except Exception:
             # Swallow on the audio thread — never propagate into PortAudio.
-            # Logged via module logger only if it's safe; in RT context we
-            # just keep going.
             pass
+        return (None, pyaudio.paContinue)
 
     # ---- diagnostics ------------------------------------------------------
 
@@ -275,6 +354,15 @@ class AudioCapture:
     @property
     def channel_names(self) -> List[str]:
         return list(self._channel_names)
+
+    @property
+    def expected_channels(self) -> int:
+        """Number of channels required by the configured layout (for diagnostics)."""
+        return self._expected_channels
+
+    @property
+    def channel_layout(self) -> str:
+        return self._channel_layout
 
 
 # ---- Convenience: a queue-backed consumer ----------------------------------

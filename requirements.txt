@@ -5,8 +5,13 @@
 numpy>=1.26
 scipy>=1.11
 
-# Audio capture (PortAudio backend, supports WASAPI loopback on Windows)
-sounddevice>=0.4.6
+# Audio capture on Windows.
+# NOTE: we use PyAudioWPatch (a PyAudio fork) instead of `sounddevice`,
+# because `sounddevice` >= 0.5 removed WASAPI loopback support (the
+# `WasapiSettings(loopback=True)` argument). PyAudioWPatch exposes WASAPI
+# loopback devices as virtual input devices with a "[Loopback]" name suffix,
+# which is stable across versions.
+PyAudioWPatch>=0.2.12
 
 # GUI
 PyQt6>=6.6
