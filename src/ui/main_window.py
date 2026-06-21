@@ -1,0 +1,250 @@
+"""
+Main application window.
+
+Responsibilities:
+  - Start / stop AudioCapture (WASAPI loopback)
+  - Run a processing thread that consumes the frame queue and runs analysis
+  - Drive the UI via a QTimer (~60 Hz): pull contacts, advance sweep
+  - Expose a single Sensitivity slider that re-maps to SNR threshold and
+    flux multiplier (see docs/06_calibration.md section 2)
+
+Thread model:
+  - Audio callback (PortAudio RT)  -> frame queue
+  - Processing thread (daemon)     -> consumes frames, runs DSP, pushes contacts
+  - UI thread (Qt)                 -> polls contact queue via QTimer
+"""
+from __future__ import annotations
+
+import queue
+import threading
+import time
+from typing import Optional
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QMainWindow, QSlider,
+                              QVBoxLayout, QWidget)
+
+from src.analysis.direction import estimate_direction
+from src.analysis.features import compute_band_energy, compute_channel_energy
+from src.analysis.noise_floor import NoiseFloorEstimator
+from src.analysis.onset import OnsetDetector
+from src.audio.capture import AudioCapture, AudioDeviceError, make_drop_on_full_queue
+from src.config_loader import AppConfig
+from src.tracking.smoother import ContactSmoother
+from src.types import AudioFrame, RadarContact
+from src.ui.radar_widget import RadarWidget
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__()
+        self._config = config
+        self._closing = False
+
+        self.setWindowTitle(config.ui.window_title)
+        self.resize(config.ui.width, config.ui.height)
+        if config.ui.always_on_top:
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+
+        # ---- UI layout ----
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        self._radar = RadarWidget(colors=config.ui.radar)
+        root.addWidget(self._radar, stretch=1)
+
+        # Sensitivity slider (0..100, default 50).
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Sensitivity"))
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, 100)
+        self._slider.setValue(50)
+        self._slider.valueChanged.connect(self._on_sensitivity_changed)
+        ctrl.addWidget(self._slider, stretch=1)
+        self._status = QLabel("idle")
+        ctrl.addWidget(self._status)
+        root.addLayout(ctrl)
+
+        self.setCentralWidget(central)
+
+        # ---- Audio capture + queues ----
+        self._frame_queue, self._on_frame_cb, self._dropped = make_drop_on_full_queue(maxsize=4)
+        self._contact_queue: "queue.Queue[list]" = queue.Queue(maxsize=2)
+
+        self._capture = AudioCapture(
+            device=config.audio.device,
+            sample_rate=config.audio.sample_rate,
+            frame_size=config.audio.frame_size,
+            channel_layout=config.audio.channel_layout,
+            on_frame=self._on_frame_cb,
+        )
+
+        # ---- Processing state (owned by processing thread) ----
+        n_channels = len(config.channel_layout_obj.names)
+        self._noise_floor = NoiseFloorEstimator(
+            n_channels=n_channels,
+            sample_rate=config.audio.sample_rate,
+            frame_size=config.audio.frame_size,
+        )
+        self._onset = OnsetDetector(
+            flux_multiplier=config.onset.flux_multiplier,
+            refractory_ms=config.onset.refractory_ms,
+        )
+        self._smoother = ContactSmoother(
+            decay_ms=config.tracking.decay_ms,
+            angle_smoothing=config.tracking.angle_smoothing,
+        )
+
+        # Live-tunable parameters (protected by a lock; processing thread
+        # reads a snapshot each frame).
+        self._params_lock = threading.Lock()
+        self._params = {
+            "snr_threshold_db": config.direction.snr_threshold_db,
+            "flux_multiplier": config.onset.flux_multiplier,
+            "ignore_channels": (["C", "LFE"]
+                                 if config.direction.ignore_center_channel else []),
+        }
+
+        self._proc_thread: Optional[threading.Thread] = None
+
+        # ---- UI timer (~60 Hz): poll contacts + advance sweep ----
+        self._last_tick = time.monotonic()
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)   # ~60 Hz
+        self._timer.timeout.connect(self._on_tick)
+        self._timer.start()
+
+    # ---- sensitivity slider ----------------------------------------------
+
+    def _on_sensitivity_changed(self, value: int) -> None:
+        # Map slider 0..100 to sensitivity_factor 2.0..0.5 (higher slider
+        # value = more sensitive = lower thresholds).
+        norm = value / 100.0
+        sensitivity_factor = 2.0 - 1.5 * norm   # 2.0 at 0, 0.5 at 100
+
+        base_snr = self._config.direction.snr_threshold_db
+        base_flux = self._config.onset.flux_multiplier
+        with self._params_lock:
+            self._params["snr_threshold_db"] = max(1.0, base_snr / sensitivity_factor)
+            self._params["flux_multiplier"] = max(0.5, base_flux / sensitivity_factor)
+            self._onset._flux_multiplier = self._params["flux_multiplier"]
+
+    # ---- lifecycle --------------------------------------------------------
+
+    def start(self) -> None:
+        try:
+            self._capture.start()
+        except AudioDeviceError as e:
+            self._status.setText(f"device error: {e}")
+            return
+        self._proc_thread = threading.Thread(target=self._processing_loop,
+                                             daemon=True)
+        self._proc_thread.start()
+        ch = self._capture.actual_channels
+        sr = self._capture.actual_sample_rate
+        self._status.setText(f"running: {ch}ch @ {int(sr)}Hz")
+
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        try:
+            self._capture.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    # ---- processing thread -----------------------------------------------
+
+    def _processing_loop(self) -> None:
+        cfg = self._config
+        layout = cfg.channel_layout_obj
+        sample_rate = cfg.audio.sample_rate
+
+        while not self._closing:
+            try:
+                frame: AudioFrame = self._frame_queue.get(timeout=0.2)
+            except queue.Empty:
+                # No audio: still decay existing contacts so they fade out.
+                contacts = self._smoother.update(None)
+                self._push_contacts(contacts)
+                continue
+
+            try:
+                contacts = self._process_one_frame(frame, layout, sample_rate)
+                self._push_contacts(contacts)
+            except Exception:
+                # Processing must never die; swallow and keep going.
+                pass
+
+    def _process_one_frame(self, frame: AudioFrame, layout, sample_rate: int):
+        # Snapshot of live params.
+        with self._params_lock:
+            snr_threshold = self._params["snr_threshold_db"]
+            ignore_channels = list(self._params["ignore_channels"])
+
+        # 1. Features.
+        channel_energy = compute_channel_energy(frame.samples)
+        band_energy = compute_band_energy(frame.samples, sample_rate)
+
+        # 2. Noise floor.
+        noise_floor = self._noise_floor.update(channel_energy)
+
+        # 3. Onset detection (event gating).
+        onset_event = self._onset.process(frame, band_energy)
+
+        # 4. Direction estimation.
+        estimate = None
+        if onset_event is not None:
+            estimate = estimate_direction(
+                channel_energy=channel_energy,
+                layout=layout,
+                noise_floor=noise_floor,
+                snr_threshold_db=snr_threshold,
+                ignore_channels=ignore_channels,
+                timestamp=onset_event.timestamp,
+            )
+
+        # 5. Smoother (decay + merge/create).
+        return self._smoother.update(estimate)
+
+    def _push_contacts(self, contacts) -> None:
+        try:
+            # Drop oldest if full.
+            try:
+                self._contact_queue.put_nowait(list(contacts))
+            except queue.Full:
+                try:
+                    self._contact_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._contact_queue.put_nowait(list(contacts))
+                except queue.Full:
+                    pass
+        except Exception:
+            pass
+
+    # ---- UI tick ---------------------------------------------------------
+
+    def _on_tick(self) -> None:
+        now = time.monotonic()
+        dt = now - self._last_tick
+        self._last_tick = now
+
+        # Drain the contact queue (keep latest).
+        latest = None
+        while True:
+            try:
+                latest = self._contact_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest is not None:
+            self._radar.set_contacts(latest)
+
+        # Advance sweep animation.
+        self._radar.advance_sweep(dt)
+
+        dropped = self._dropped()
+        if dropped > 0:
+            # Light-touch status update; avoid spamming.
+            pass

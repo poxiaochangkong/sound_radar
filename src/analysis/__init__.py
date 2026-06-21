@@ -1,0 +1,1 @@
+"""Acoustic analysis layer (pure functions / small stateful estimators)."""

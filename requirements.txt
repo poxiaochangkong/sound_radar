@@ -1,0 +1,18 @@
+# Sound Radar - Python dependencies
+# Python 3.9+ compatible
+
+# Numerical / DSP
+numpy>=1.26
+scipy>=1.11
+
+# Audio capture (PortAudio backend, supports WASAPI loopback on Windows)
+sounddevice>=0.4.6
+
+# GUI
+PyQt6>=6.6
+
+# Configuration
+PyYAML>=6.0
+
+# Testing (dev only, but listed here for reproducibility)
+pytest>=7.4

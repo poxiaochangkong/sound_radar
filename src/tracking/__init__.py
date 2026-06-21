@@ -1,0 +1,1 @@
+"""Temporal tracking layer (smoothing, decay)."""

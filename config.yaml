@@ -1,0 +1,88 @@
+# ============================================================
+# Sound Radar - Global Configuration
+# ============================================================
+# Design principle: NO game-specific magic values.
+# All thresholds are either adaptive (derived from noise floor)
+# or exposed as a single, intuitive sensitivity knob.
+# ============================================================
+
+audio:
+  # Source device: null = system default rendering device (WASAPI loopback).
+  # If you use a virtual sound card (VoiceMeeter), set its name here.
+  device: null
+  sample_rate: 48000          # Hz. Most FPS games output 48kHz.
+  frame_size: 1024            # samples per channel per frame (~21ms @48k)
+  channel_layout: "7.1"       # one of: "7.1" | "5.1" | "stereo"
+
+# ITU-R BS.775 / ITU-R BS.2159 speaker angles.
+# angle_deg: 0 = front center, positive = clockwise, negative = counter-clockwise.
+# null = channel does not carry positional info (e.g. LFE).
+channel_angles:
+  "7.1":
+    L:   -30
+    R:    30
+    C:     0
+    LFE:  null
+    Ls: -110
+    Rs:  110
+    Lb: -150
+    Rb:  150
+  "5.1":
+    L:   -30
+    R:    30
+    C:     0
+    LFE:  null
+    Ls: -110
+    Rs:  110
+  "stereo":
+    L:   -30
+    R:    30
+
+# --- Direction estimation ---
+direction:
+  # Minimum signal-to-noise ratio (dB) above noise floor to be considered an event.
+  # Adaptive: noise floor is estimated online.
+  snr_threshold_db: 12.0
+
+  # If true, ignore the center channel when localizing.
+  # Rationale: many FPS games mix non-positional UI/ambient sounds to center,
+  # which would falsely read as "front". Disable only for games you trust.
+  ignore_center_channel: true
+
+# --- Event detection (onset) ---
+onset:
+  # Spectral flux threshold for detecting a transient event.
+  # Adaptive: this is a *multiplier* on the median spectral flux, not an absolute value.
+  flux_multiplier: 3.0
+
+  # Minimum refractory time between two events on the same bearing (ms).
+  refractory_ms: 120
+
+# --- Tracking / smoothing ---
+tracking:
+  # Exponential decay half-life for a radar contact after the event ends (ms).
+  # Larger = blips stay visible longer.
+  decay_ms: 400
+
+  # Temporal smoothing (low-pass) factor for angle, 0..1.
+  # 0 = no smoothing, 1 = frozen.
+  angle_smoothing: 0.35
+
+# --- UI ---
+ui:
+  # Window title and dimensions
+  window_title: "Sound Radar"
+  width: 480
+  height: 480
+  always_on_top: true
+  frameless: false
+
+  # Radar display
+  radar:
+    background: "#0a0e14"
+    grid_color: "#1f2937"
+    sweep_color: "#22d3ee"
+    contact_color: "#f59e0b"
+    front_zone_color: "#10b981"   # [-30, 30] deg
+    side_zone_color:  "#3b82f6"   # [-110,-30] or [30,110]
+    back_zone_color:  "#ef4444"   # outside side
