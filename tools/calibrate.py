@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.audio.capture import AudioCapture, AudioDeviceError, make_drop_on_full_queue
 from src.config_loader import load_config
-from src.types import AudioFrame
+from src.models import AudioFrame
 
 
 def _collect_seconds(frame_queue, seconds: float, label: str) -> List[AudioFrame]:

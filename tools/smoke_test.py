@@ -17,12 +17,12 @@ from PyQt6.QtWidgets import QApplication
 
 from src.config_loader import load_config
 from src.ui.main_window import MainWindow
-from src.types import RadarContact
+from src.models import RadarContact
 
 
 def main() -> int:
     # 1. Import-check every module explicitly.
-    import src.types
+    import src.models
     import src.config_loader
     import src.audio.capture
     import src.audio.framing

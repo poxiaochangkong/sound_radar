@@ -18,7 +18,7 @@ from PyQt6.QtGui import (QBrush, QColor, QPainter, QPen, QRadialGradient,
                          QLinearGradient)
 from PyQt6.QtWidgets import QWidget
 
-from src.types import RadarContact
+from src.models import RadarContact
 
 
 def _color(hex_str: str, alpha: int = 255) -> QColor:

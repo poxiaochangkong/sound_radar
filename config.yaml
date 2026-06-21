@@ -8,8 +8,10 @@
 
 audio:
   # Source device: null = system default rendering device (WASAPI loopback).
-  # If you use a virtual sound card (VoiceMeeter), set its name here.
-  device: null
+  # To use VoiceMeeter: set its exact name (case-insensitive substring match).
+  # Use `python src/main.py --list-devices` to find the exact name.
+  # Your environment shows: "Voicemeeter Input (VB-Audio Voicemeeter VAIO)" (8ch)
+  device: "Voicemeeter Input"
   sample_rate: 48000          # Hz. Most FPS games output 48kHz.
   frame_size: 1024            # samples per channel per frame (~21ms @48k)
   channel_layout: "7.1"       # one of: "7.1" | "5.1" | "stereo"
@@ -42,6 +44,7 @@ channel_angles:
 direction:
   # Minimum signal-to-noise ratio (dB) above noise floor to be considered an event.
   # Adaptive: noise floor is estimated online.
+  # This is the BASE value at slider=50; the UI slider scales it in real time.
   snr_threshold_db: 12.0
 
   # If true, ignore the center channel when localizing.
@@ -53,9 +56,12 @@ direction:
 onset:
   # Spectral flux threshold for detecting a transient event.
   # Adaptive: this is a *multiplier* on the median spectral flux, not an absolute value.
+  # This is the BASE value at slider=50; the UI slider scales it in real time.
   flux_multiplier: 3.0
 
-  # Minimum refractory time between two events on the same bearing (ms).
+  # Minimum refractory time between two events in the SAME band (ms).
+  # Per-band: an onset in the high band does not suppress a near-simultaneous
+  # onset in the low band.
   refractory_ms: 120
 
 # --- Tracking / smoothing ---

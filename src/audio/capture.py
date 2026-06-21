@@ -26,7 +26,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import sounddevice as sd
 
-from src.types import AudioFrame
+from src.models import AudioFrame
 
 logger = logging.getLogger(__name__)
 

@@ -9,7 +9,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.analysis.onset import OnsetDetector
-from src.types import AudioFrame
+from src.models import AudioFrame
 
 
 def _frame(samples: np.ndarray, t: float) -> AudioFrame:

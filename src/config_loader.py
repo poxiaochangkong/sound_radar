@@ -12,7 +12,7 @@ from typing import Optional
 
 import yaml
 
-from src.types import channel_layout_for, ChannelLayout
+from src.models import channel_layout_for, ChannelLayout
 
 
 class ConfigError(Exception):

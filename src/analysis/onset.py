@@ -19,7 +19,7 @@ from typing import Deque, Optional
 
 import numpy as np
 
-from src.types import AudioFrame, OnsetEvent
+from src.models import AudioFrame, OnsetEvent
 
 
 class OnsetDetector:

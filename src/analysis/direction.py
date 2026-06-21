@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from src.types import ChannelLayout, DirectionEstimate
+from src.models import ChannelLayout, DirectionEstimate
 
 # Small value added to energy/noise before division/log to avoid blow-ups.
 _EPS: float = 1e-10

@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.tracking.smoother import ContactSmoother
-from src.types import DirectionEstimate
+from src.models import DirectionEstimate
 
 
 class FakeClock:

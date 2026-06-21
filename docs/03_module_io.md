@@ -5,7 +5,7 @@
 > **更新历史**
 > - 2026-06-21: OnsetDetector 增加了 `n_bands` 参数与 per-band refractory(与原"同频段内抑制"的文档描述对齐);新增线程安全 setter `set_flux_multiplier`;`AudioCapture` 新增 `preflight_device()` 用于启动时声道数自检。
 
-## 0. 共享数据结构(`src/types.py`)
+## 0. 共享数据结构(`src/models.py`)
 
 ```python
 from dataclasses import dataclass, field

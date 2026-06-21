@@ -37,7 +37,7 @@ from src.analysis.onset import OnsetDetector
 from src.audio.capture import AudioCapture, AudioDeviceError, make_drop_on_full_queue
 from src.config_loader import AppConfig
 from src.tracking.smoother import ContactSmoother
-from src.types import AudioFrame
+from src.models import AudioFrame
 from src.ui.radar_widget import RadarWidget
 
 logger = logging.getLogger(__name__)

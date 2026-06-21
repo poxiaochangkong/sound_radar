@@ -13,7 +13,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.analysis.direction import estimate_direction
-from src.types import ChannelLayout
+from src.models import ChannelLayout
 
 
 # Standard 7.1 layout, matching config.yaml

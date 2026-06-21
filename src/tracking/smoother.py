@@ -10,7 +10,7 @@ import math
 import time
 from typing import List, Optional
 
-from src.types import DirectionEstimate, RadarContact
+from src.models import DirectionEstimate, RadarContact
 
 # A new event that arrives within MERGE_ANGLE_DEG of an existing contact
 # refreshes that contact instead of creating a new one.
