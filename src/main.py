@@ -2,12 +2,16 @@
 Sound Radar entry point.
 
 Usage:
-    python src/main.py [--config config.yaml] [--profile profiles/csgo.yaml]
+    python src/main.py [--config config.yaml] [--profile profiles/csgo.yaml] [--debug]
 
 Before opening the UI, we run a WASAPI preflight check: resolve the device,
 verify it advertises enough output channels for the configured layout, and
 print an actionable error if the Windows default device is not configured
 for multichannel output. See docs/06_calibration.md section 4.
+
+--debug mode prints real-time per-frame diagnostics to the terminal:
+    flux, SNR per channel, onset yes/no, direction angle + contributing
+channels. Use it to see why footsteps/gunshots do or don't trigger.
 """
 from __future__ import annotations
 
@@ -35,7 +39,9 @@ def parse_args():
     p.add_argument("--profile", default=None,
                    help="optional path to a per-game profile yaml")
     p.add_argument("--list-devices", action="store_true",
-                   help="list WASAPI output devices and exit")
+                   help="list loopback devices and exit")
+    p.add_argument("--debug", action="store_true",
+                   help="print real-time per-frame diagnostics to the terminal")
     return p.parse_args()
 
 
@@ -48,11 +54,11 @@ def _preflight_check(capture: AudioCapture) -> None:
     try:
         dev = capture.preflight_device()
         print(f"[preflight] device: {dev}")
-        print(f"[preflight] layout '{capture._channel_layout}' requires "
-              f"{capture._expected_channels} channels — OK")
+        print(f"[preflight] layout '{capture.channel_layout}' requires "
+              f"{capture.expected_channels} channels — OK")
     except AudioDeviceError as e:
         print(f"[ERROR] Audio preflight failed:\n  {e}", file=sys.stderr)
-        print("\nAvailable WASAPI output devices:", file=sys.stderr)
+        print("\nAvailable loopback devices:", file=sys.stderr)
         try:
             for d in AudioCapture.list_devices():
                 print(f"  {d}", file=sys.stderr)
@@ -69,7 +75,7 @@ def main() -> int:
     args = parse_args()
 
     if args.list_devices:
-        print("WASAPI output devices:")
+        print("Loopback devices:")
         for d in AudioCapture.list_devices():
             print(f"  {d}")
         return 0
@@ -90,14 +96,8 @@ def main() -> int:
 
     app = QApplication(sys.argv)
 
-    # Build the capture object so we can preflight it before showing the UI.
-    # MainWindow will own the same capture instance via its own constructor,
-    # so we construct the window first and reuse its capture for preflight.
-    win = MainWindow(config)
+    win = MainWindow(config, debug=args.debug)
 
-    # Preflight the capture device (non-fatal if it fails: the window will
-    # also surface the error in its status bar, but a clear stderr message
-    # helps users who launch from a terminal).
     try:
         _preflight_check(win._capture)
     except SystemExit:

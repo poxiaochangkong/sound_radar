@@ -7,6 +7,7 @@ Responsibilities:
   - Drive the UI via a QTimer (~60 Hz): pull contacts, advance sweep
   - Expose a single Sensitivity slider that re-maps to SNR threshold and
     flux multiplier (see docs/06_calibration.md section 2)
+  - Optional --debug mode prints real-time per-frame diagnostics
 
 Thread model:
   - Audio callback (PortAudio RT)  -> frame queue
@@ -26,6 +27,7 @@ import threading
 import time
 from typing import Optional
 
+import numpy as np
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QMainWindow, QSlider,
                               QVBoxLayout, QWidget)
@@ -42,12 +44,17 @@ from src.ui.radar_widget import RadarWidget
 
 logger = logging.getLogger(__name__)
 
+# In debug mode, only print frames whose total energy exceeds this fraction of
+# the recent peak, to avoid flooding the terminal with silent frames.
+_DEBUG_ENERGY_FRACTION = 0.10
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, debug: bool = False) -> None:
         super().__init__()
         self._config = config
         self._closing = False
+        self._debug = debug
 
         self.setWindowTitle(config.ui.window_title)
         self.resize(config.ui.width, config.ui.height)
@@ -112,10 +119,14 @@ class MainWindow(QMainWindow):
         self._params = {
             "snr_threshold_db": float(config.direction.snr_threshold_db),
             "ignore_channels": (["C", "LFE"]
-                                 if config.direction.ignore_center_channel else []),
+                                 if config.direction.ignore_center_channel else ["LFE"]),
         }
 
         self._proc_thread: Optional[threading.Thread] = None
+
+        # Debug-mode rolling peak for throttling terminal output.
+        self._dbg_peak_energy = 1e-12
+        self._dbg_frame_count = 0
 
         # ---- UI timer (~60 Hz): poll contacts + advance sweep ----
         self._last_tick = time.monotonic()
@@ -162,6 +173,10 @@ class MainWindow(QMainWindow):
         sr = self._capture.actual_sample_rate
         self._status.setText(f"running: {ch}ch @ {int(sr)}Hz")
         logger.info("audio started: %sch @ %sHz", ch, sr)
+        if self._debug:
+            print("[debug] per-frame diagnostics enabled. Legend:")
+            print("        E=per-channel energy  NF=noise floor  "
+                  "SNR=max SNR  onset=YES/NO  dir=angle/channels")
 
     def closeEvent(self, event) -> None:
         self._closing = True
@@ -225,8 +240,53 @@ class MainWindow(QMainWindow):
                 timestamp=onset_event.timestamp,
             )
 
-        # 4. Smoother (decay + merge/create).
+        # 4. Debug diagnostics (only print when relevant, to avoid flooding).
+        if self._debug:
+            self._debug_print(frame, channel_energy, noise_floor,
+                              snr_threshold, onset_event, estimate)
+
+        # 5. Smoother (decay + merge/create).
         return self._smoother.update(estimate)
+
+    def _debug_print(self, frame, channel_energy, noise_floor,
+                     snr_threshold, onset_event, estimate) -> None:
+        """Print compact per-frame diagnostics. Throttled to interesting frames."""
+        self._dbg_frame_count += 1
+        total_e = float(channel_energy.sum())
+        # Track a rolling peak so we can print "above 10% of recent peak" frames.
+        if total_e > self._dbg_peak_energy:
+            self._dbg_peak_energy = total_e
+        # Print frame if it's an onset OR clearly above ambient (>10% peak).
+        is_onset = onset_event is not None
+        is_loud = total_e > self._dbg_peak_energy * _DEBUG_ENERGY_FRACTION
+        if not (is_onset or is_loud):
+            return
+
+        names = frame.channel_names
+        # Short per-channel energy string, skipping near-zero channels.
+        e_parts = []
+        for i, name in enumerate(names):
+            if channel_energy[i] > 1e-7:
+                e_parts.append(f"{name}={channel_energy[i]:.2e}")
+        e_str = " ".join(e_parts) if e_parts else "(silent)"
+
+        # Max SNR across channels.
+        eps = 1e-10
+        snr_db = 10.0 * np.log10((channel_energy + eps) / (noise_floor + eps))
+        snr_max = float(snr_db.max())
+        snr_max_ch = names[int(snr_db.argmax())]
+
+        onset_str = f"YES(band={onset_event.band_index})" if onset_event else "NO"
+        if estimate is not None:
+            dir_str = (f"dir={estimate.angle_deg:+.0f}deg "
+                       f"conf={estimate.confidence:.2f} "
+                       f"ch={','.join(estimate.contributing_channels)}")
+        else:
+            dir_str = "dir=None"
+
+        print(f"[f{self._dbg_frame_count}] E[{e_str}] "
+              f"SNRmax={snr_max:.1f}dB({snr_max_ch}) "
+              f"thr={snr_threshold:.1f}dB onset={onset_str} {dir_str}")
 
     def _push_contacts(self, contacts) -> None:
         try:

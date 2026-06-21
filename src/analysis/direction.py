@@ -4,7 +4,7 @@ VBAP-style multichannel direction estimation.
 Core algorithm (pure function, no state, easily unit-testable):
   1. Skip ignored channels and channels with angle is None (e.g. LFE).
   2. Compute per-channel SNR vs noise floor.
-  3. If max SNR < snr_threshold_db, return None (no trusted event).
+  3. If no channel clears snr_threshold_db, return None (no trusted event).
   4. Take the channel with the highest SNR (A) and its best angular neighbor
      B among channels that ALSO clear the threshold.
   5. Weighted-average A and B's angles using SNR-linear weights.
@@ -25,10 +25,13 @@ _EPS: float = 1e-10
 # SNR headroom (dB) above threshold at which confidence saturates to 1.0.
 _DEFAULT_HEADROOM_DB: float = 18.0
 
-# Channels ignored by default. Matches docs/05_algorithm.md section 4.3:
-# many FPS games mix non-positional UI/ambient audio into C, which would
-# otherwise be misread as "front". LFE carries no positional info at all.
-_DEFAULT_IGNORE: List[str] = ["C", "LFE"]
+# Channels ignored by default.
+# LFE always carries no positional info (angle == None) so it is skipped
+# regardless. We NO LONGER ignore C by default: many users want front-source
+# accuracy, and ignoring C collapses front resolution to L/R (±15°).
+# Callers can still pass ignore_channels=["C", "LFE"] explicitly if a game
+# pushes lots of UI/ambient sound through C.
+_DEFAULT_IGNORE: List[str] = ["LFE"]
 
 
 def _angular_difference(a_deg: float, b_deg: float) -> float:
@@ -45,7 +48,7 @@ def estimate_direction(
     channel_energy: np.ndarray,
     layout: ChannelLayout,
     noise_floor: np.ndarray,
-    snr_threshold_db: float = 12.0,
+    snr_threshold_db: float = 4.0,
     ignore_channels: Optional[List[str]] = None,
     headroom_db: float = _DEFAULT_HEADROOM_DB,
     timestamp: float = 0.0,
@@ -57,9 +60,9 @@ def estimate_direction(
       layout         : ChannelLayout whose .names aligns with channel_energy
       noise_floor    : shape=(n_channels,), float, > 0
       ignore_channels:
-        None  -> use default (["C", "LFE"])
-        []    -> ignore nothing
-        [...] -> ignore exactly these channel names
+        None  -> use default (["LFE"]) — C is now INCLUDED for front accuracy.
+        []    -> ignore nothing extra (LFE still excluded because angle is None)
+        [...] -> ignore exactly these channel names (LFE always excluded)
     Output:
       DirectionEstimate or None.
 

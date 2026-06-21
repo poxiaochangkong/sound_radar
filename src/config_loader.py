@@ -89,11 +89,15 @@ _HARD_DEFAULTS = {
         },
     },
     "direction": {
-        "snr_threshold_db": 8.0,
-        "ignore_center_channel": True,
+        # Low threshold so footsteps (SNR ~5-8 dB above ambient) trigger.
+        "snr_threshold_db": 4.0,
+        # Keep C channel for better front-direction resolution. Set True only
+        # if your game pushes lots of UI/ambient sound through C.
+        "ignore_center_channel": False,
     },
     "onset": {
-        "flux_multiplier": 2.5,
+        # Low multiplier so footsteps (flux ~1.5-2x median) trigger.
+        "flux_multiplier": 1.5,
         "refractory_ms": 120,
     },
     "tracking": {

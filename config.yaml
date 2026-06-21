@@ -45,22 +45,25 @@ direction:
   # Minimum signal-to-noise ratio (dB) above noise floor to be considered an event.
   # Adaptive: noise floor is estimated online.
   # This is the BASE value at slider=50; the UI slider scales it in real time.
-  # Tuned down from 12.0 to 8.0: real game transients often have SNR 8-15 dB
-  # above the ambient mix, and 12 dB was too strict (caused missed detections).
-  snr_threshold_db: 8.0
+  # Tuned down to 4.0 so footsteps (SNR ~5-8 dB above ambient) can trigger.
+  snr_threshold_db: 4.0
 
   # If true, ignore the center channel when localizing.
   # Rationale: many FPS games mix non-positional UI/ambient sounds to center,
-  # which would falsely read as "front". Disable only for games you trust.
-  ignore_center_channel: true
+  # which would falsely read as "front".
+  # BUT: ignoring C collapses front-direction resolution to L/R (±15°), making
+  # front-source bearing jitter between "front-left" and "front-right".
+  # Set to false for better front-direction accuracy; set to true only if your
+  # game pushes lots of UI/ambient sound through C.
+  ignore_center_channel: false
 
 # --- Event detection (onset) ---
 onset:
   # Spectral flux threshold for detecting a transient event.
   # Adaptive: this is a *multiplier* on the median spectral flux, not an absolute value.
   # This is the BASE value at slider=50; the UI slider scales it in real time.
-  # Tuned down from 3.0 to 2.5: 3.0 missed many real footsteps/gunshots.
-  flux_multiplier: 2.5
+  # Tuned down to 1.5 so footsteps (spectral flux ~1.5-2x median) can trigger.
+  flux_multiplier: 1.5
 
   # Minimum refractory time between two events in the SAME band (ms).
   # Per-band: an onset in the high band does not suppress a near-simultaneous
