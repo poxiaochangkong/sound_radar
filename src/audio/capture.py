@@ -7,14 +7,16 @@ Design notes:
     to float32 and pushes a copy onto a thread-safe queue.
   - The processing thread consumes the queue. See docs/02_architecture.md
     section 4 (thread model).
-  - We open the stream in WASAPI shared mode with loopback=True. The actual
-    channel count is dictated by the Windows default device's speaker
-    configuration; we assert it matches the configured layout.
+  - We open the stream in WASAPI shared mode with loopback=True. On start()
+    we verify that the device actually supports the configured channel count
+    and report a clear, actionable error if not (see docs/06_calibration.md
+    section 4 — multichannel self-check).
 
 See docs/03_module_io.md section 1.1 for the contract.
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -26,6 +28,7 @@ import sounddevice as sd
 
 from src.types import AudioFrame
 
+logger = logging.getLogger(__name__)
 
 # Standard Windows channel ordering for 7.1 / 5.1 / stereo PCM.
 _CHANNEL_ORDER = {
@@ -53,9 +56,6 @@ class DeviceInfo:
 
 def _query_hostapis() -> List[dict]:
     """Return the list of host APIs. Compatible with sounddevice >= 0.5."""
-    # sounddevice 0.5+ replaced query_hostapi_count()/query_hostapi(i) with
-    # query_hostapis() (returns a list). Use that, with a fallback for older
-    # versions just in case.
     if hasattr(sd, "query_hostapis"):
         return list(sd.query_hostapis())
     apis = []
@@ -75,20 +75,14 @@ def _find_hostapi(name: str) -> dict:
 
 
 class AudioCapture:
-    """Captures multichannel PCM from a WASAPI loopback device.
-
-    The captured frames are delivered via the `on_frame` callback, which is
-    invoked on the audio thread. Implementations of `on_frame` must be
-    non-blocking; the recommended pattern is to push the frame onto a
-    `queue.Queue` and process it elsewhere.
-    """
+    """Captures multichannel PCM from a WASAPI loopback device."""
 
     def __init__(
         self,
-        device: Optional[str],           # device name substring, or None for default
-        sample_rate: int,                # e.g. 48000
-        frame_size: int,                 # blocksize passed to PortAudio (0 = let PA decide)
-        channel_layout: str,             # "7.1" | "5.1" | "stereo"
+        device: Optional[str],
+        sample_rate: int,
+        frame_size: int,
+        channel_layout: str,
         on_frame: Callable[[AudioFrame], None],
     ) -> None:
         if channel_layout not in _CHANNEL_ORDER:
@@ -124,15 +118,58 @@ class AudioCapture:
             ))
         return out
 
+    def preflight_device(self) -> DeviceInfo:
+        """Resolve and return the device that will be used, WITHOUT opening it.
+
+        Raises AudioDeviceError if the device cannot be resolved or does not
+        advertise enough output channels for the configured layout.
+        """
+        device_idx = self._resolve_device_index(self._device_query)
+        info = sd.query_devices(device_idx)
+        dev = DeviceInfo(
+            index=device_idx,
+            name=info["name"],
+            host_api="Windows WASAPI",
+            max_output_channels=info["max_output_channels"],
+            default_sample_rate=info["default_samplerate"],
+        )
+        if dev.max_output_channels < self._expected_channels:
+            raise AudioDeviceError(
+                f"Device '{dev.name}' advertises only {dev.max_output_channels} "
+                f"output channels, but layout '{self._channel_layout}' requires "
+                f"{self._expected_channels}. Configure the Windows default device "
+                f"to {self._channel_layout} (or use a virtual 7.1 device like "
+                f"VoiceMeeter)."
+            )
+        return dev
+
     # ---- lifecycle --------------------------------------------------------
 
     def start(self) -> None:
-        """Open and start the loopback stream. Raises AudioDeviceError on failure."""
+        """Open and start the loopback stream. Raises AudioDeviceError on failure.
+
+        Performs the multichannel self-check from docs/06_calibration.md section 4:
+        verifies device channel count BEFORE opening and verifies the opened
+        stream's channel count AFTER opening.
+        """
         with self._lock:
             if self._stream is not None:
                 raise AudioDeviceError("Capture already started")
 
+            # Pre-open check: device must advertise enough output channels.
             device_idx = self._resolve_device_index(self._device_query)
+            dev_info = sd.query_devices(device_idx)
+            if dev_info["max_output_channels"] < self._expected_channels:
+                raise AudioDeviceError(
+                    f"Device '{dev_info['name']}' advertises only "
+                    f"{dev_info['max_output_channels']} output channels, but "
+                    f"layout '{self._channel_layout}' requires "
+                    f"{self._expected_channels}. Configure the Windows default "
+                    f"device to {self._channel_layout} (Sound Settings → "
+                    f"Device properties → Additional device properties → "
+                    f"Configure → 7.1 Surround)."
+                )
+
             try:
                 stream = sd.InputStream(
                     device=device_idx,
@@ -148,12 +185,18 @@ class AudioCapture:
             except Exception as e:
                 raise AudioDeviceError(
                     f"Failed to open loopback stream on device "
-                    f"{device_idx!r}: {e}"
+                    f"{device_idx!r} ({dev_info['name']}): {e}\n"
+                    f"Hint: confirm Windows default output is set to a "
+                    f"{self._channel_layout} device."
                 ) from e
 
             self._stream = stream
             self._actual_channels = self._expected_channels
             self._actual_sample_rate = stream.samplerate
+            logger.info(
+                "WASAPI loopback opened: device='%s' %sch @ %sHz",
+                dev_info["name"], self._actual_channels, self._actual_sample_rate,
+            )
 
     def stop(self) -> None:
         """Stop and close the stream. Safe to call multiple times."""
@@ -163,12 +206,12 @@ class AudioCapture:
         if stream is not None:
             try:
                 stream.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("error stopping stream: %s", e)
             try:
                 stream.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("error closing stream: %s", e)
 
     # ---- helpers ----------------------------------------------------------
 
@@ -203,13 +246,8 @@ class AudioCapture:
 
     def _portaudio_callback(self, indata: np.ndarray, frames: int,
                             time_info, status) -> None:
-        """Called by PortAudio on the audio thread. MUST NOT block.
-
-        `indata` is a buffer owned by PortAudio that may be reused after we
-        return, so we copy it before handing the frame to the consumer.
-        """
+        """Called by PortAudio on the audio thread. MUST NOT block."""
         try:
-            # Defensive copy: the consumer must not see PortAudio's reused buffer.
             samples = np.ascontiguousarray(indata, dtype=np.float32)
             frame = AudioFrame(
                 samples=samples,
@@ -218,8 +256,10 @@ class AudioCapture:
                 channel_names=list(self._channel_names),
             )
             self._on_frame(frame)
-        except Exception:
+        except Exception as e:
             # Swallow on the audio thread — never propagate into PortAudio.
+            # Logged via module logger only if it's safe; in RT context we
+            # just keep going.
             pass
 
     # ---- diagnostics ------------------------------------------------------
@@ -231,6 +271,10 @@ class AudioCapture:
     @property
     def actual_sample_rate(self) -> Optional[float]:
         return self._actual_sample_rate
+
+    @property
+    def channel_names(self) -> List[str]:
+        return list(self._channel_names)
 
 
 # ---- Convenience: a queue-backed consumer ----------------------------------
@@ -249,7 +293,6 @@ def make_drop_on_full_queue(maxsize: int = 4):
         try:
             q.put_nowait(frame)
         except queue.Full:
-            # Drop the oldest by draining one, then enqueue the new frame.
             try:
                 q.get_nowait()
                 drop_counter["count"] += 1

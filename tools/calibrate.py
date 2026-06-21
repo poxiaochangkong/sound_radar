@@ -21,7 +21,6 @@ import argparse
 import os
 import queue
 import sys
-import threading
 import time
 from typing import List
 
@@ -35,8 +34,7 @@ from src.config_loader import load_config
 from src.types import AudioFrame
 
 
-def _collect_seconds(capture: AudioCapture, frame_queue, seconds: float,
-                     label: str) -> List[AudioFrame]:
+def _collect_seconds(frame_queue, seconds: float, label: str) -> List[AudioFrame]:
     """Collect frames for `seconds` seconds. Returns the captured frames."""
     print(f"[calibrate] {label} — capturing {seconds:.0f}s...", flush=True)
     deadline = time.monotonic() + seconds
@@ -95,15 +93,17 @@ def main() -> int:
         print(f"[ERROR] {e}", file=sys.stderr)
         return 1
 
+    channel_names = capture.channel_names  # public property
+
     try:
         print("[calibrate] >>> STEP 1: keep the game SILENT for "
               f"{args.seconds_quiet:.0f}s (no movement, no gunfire)")
-        quiet_frames = _collect_seconds(capture, frame_queue,
+        quiet_frames = _collect_seconds(frame_queue,
                                          args.seconds_quiet, "QUIET")
 
         print("[calibrate] >>> STEP 2: play NORMALLY for "
               f"{args.seconds_active:.0f}s (walk, shoot, explosions)")
-        active_frames = _collect_seconds(capture, frame_queue,
+        active_frames = _collect_seconds(frame_queue,
                                           args.seconds_active, "ACTIVE")
     finally:
         capture.stop()
@@ -112,22 +112,15 @@ def main() -> int:
     quiet_energy = _per_channel_mean_energy(quiet_frames)
     active_energy = _per_channel_mean_energy(active_frames)
 
-    # Per-channel median energy in quiet phase = robust noise floor.
-    channel_names = capture._channel_names
     noise_floor_baseline = {
         name: float(val) for name, val in zip(channel_names, quiet_energy)
     }
 
-    # Recommended SNR threshold: P95 of activity energy / median quiet energy,
-    # expressed in dB, with a sane floor.
     eps = 1e-10
-    # Use the maximum over channels as the representative activity level.
     ratio_db = 10 * np.log10((active_energy.max() + eps) /
                               (np.median(quiet_energy) + eps))
     recommended_snr = float(max(8.0, min(25.0, ratio_db * 0.5)))
 
-    # Recommended flux multiplier: median + 1.5 * std of active flux, as a
-    # multiplier on the median. Clamped to a reasonable range.
     fluxes = _spectral_flux_series(active_frames)
     if fluxes.size > 0 and np.median(fluxes) > 0:
         flux_mult = (np.median(fluxes) + 1.5 * fluxes.std()) / np.median(fluxes)
@@ -135,8 +128,6 @@ def main() -> int:
     else:
         recommended_flux = 3.0
 
-    # Recommended decay: short if events are frequent, long if sparse.
-    # Use a fixed default of 400ms; calibration rarely needs to touch it.
     recommended_decay = 400
 
     profile = {

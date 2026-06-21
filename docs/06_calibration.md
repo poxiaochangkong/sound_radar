@@ -12,13 +12,13 @@
 
 ## 2. 快速标定:实时灵敏度滑杆
 
-UI 提供单个 `Sensitivity` 滑杆(范围 0–100),背后映射到核心参数:
+UI 提供单个 `Sensitivity` 滑杆(范围 0–100),**数值越大越敏感**(即越容易触发)。背后映射到核心参数:
 
 ```
 slider_value (0..100)
-    │
+    │  数值越大 → sensitivity_factor 越大
     ▼
-sensitivity_factor (0.5..2.0)   # 线性映射
+sensitivity_factor (0.5..2.0)   # 0.5 at slider=0, 2.0 at slider=100
     │
     ├──▶ effective_snr_threshold = snr_threshold_db / sensitivity_factor
     └──▶ effective_flux_multiplier = flux_multiplier / sensitivity_factor
@@ -26,13 +26,13 @@ sensitivity_factor (0.5..2.0)   # 线性映射
 
 | 滑杆值 | 含义 | 行为 |
 |---|---|---|
+| 100(最右) | 最敏感 | 安静环境、远距离脚步;误报增多 |
 | 50(默认) | 标准 | 适合多数游戏 |
-| < 50 | 更敏感 | 安静环境、远距离脚步;误报增多 |
-| > 50 | 更不敏感 | 嘈杂环境、爆炸频繁;漏报增多 |
+| 0(最左) | 最不敏感 | 嘈杂环境、爆炸频繁;漏报增多 |
 
 **调参建议**:
-1. 进入游戏空旷处,无人走动 → 调到刚好**无任何雷达点**(通常 55–70)
-2. 让朋友在 10 米外走动 → 调到能**稳定显示**其方位(通常 40–55)
+1. 进入游戏空旷处,无人走动 → 调到刚好**无任何雷达点**(通常 30–50)
+2. 让朋友在 10 米外走动 → 调到能**稳定显示**其方位(通常 50–70)
 3. 长时间游戏后微调
 
 ---
@@ -100,15 +100,27 @@ python src/main.py --profile profiles/csgo.yaml
 
 ## 4. 多声道布局自检
 
-启动时软件会自动检查:
-- WASAPI 实际返回的声道数
-- 与 `config.yaml` 中 `channel_layout` 是否匹配
-- 不匹配时:**报错并引导**,绝不静默下混
+启动时软件会自动检查(`AudioCapture.start()`):
+- WASAPI 默认输出设备的 `max_output_channels`
+- 与 `config.yaml` 中 `channel_layout` 所需声道数
+- 不匹配时:**报错并给出明确修复指引**,绝不静默下混
 
+示例错误:
 ```
-[ERROR] Configured channel_layout=7.1 (8 channels),
-        but WASAPI returns 2 channels.
-        Fix: set Windows default device to 7.1 surround.
+[ERROR] Audio preflight failed:
+  Device '扬声器 (Realtek)' advertises only 2 output channels,
+  but layout '7.1' requires 8. Configure the Windows default device
+  to 7.1 (Sound Settings → Device properties → Additional device
+  properties → Configure → 7.1 Surround).
+
+Available WASAPI output devices:
+  [8] 扬声器 (Realtek(R) Audio) (Windows WASAPI, 2ch)
+  ...
+```
+
+可加 `--list-devices` 参数仅列出设备(不开 UI):
+```powershell
+python src/main.py --list-devices
 ```
 
 ---
@@ -137,11 +149,11 @@ python src/main.py --profile profiles/csgo.yaml
 
 | 症状 | 可能原因 | 检查 |
 |---|---|---|
-| 雷达完全无反应 | 设备不是 7.1 | WASAPI 声道数自检 |
-| 雷达永远在正前 | C 声道混入 UI 声 | `ignore_center_channel: true` |
+| 雷达完全无反应 | 设备不是 7.1 | 启动时的 preflight 报错;或 `--list-devices` 看声道数 |
+| 雷达永远在正前 | C 声道混入 UI 声 | `ignore_center_channel: true`(默认) |
 | 方位明显反相(左右反) | 声道顺序与标准不符 | 用 record 工具检查每声道 |
-| 枪声无反应 | flux_multiplier 太高 | 滑杆调小 |
-| 脚步过于敏感 | snr_threshold 太低 | 滑杆调大 |
+| 枪声无反应 | flux_multiplier 太高 | 灵敏度滑杆拖到**右边** |
+| 脚步过于敏感 | snr_threshold 太低 | 灵敏度滑杆拖到**左边** |
 
 ---
 

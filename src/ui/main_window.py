@@ -12,9 +12,15 @@ Thread model:
   - Audio callback (PortAudio RT)  -> frame queue
   - Processing thread (daemon)     -> consumes frames, runs DSP, pushes contacts
   - UI thread (Qt)                 -> polls contact queue via QTimer
+
+Concurrency contract (docs/03_module_io.md section 6):
+  - The UI thread never mutates processing state directly.
+  - Tunable parameters are read by the processing thread from a locked snapshot.
+  - The onset detector's flux_multiplier is updated through its own locked setter.
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -25,14 +31,16 @@ from PyQt6.QtWidgets import (QHBoxLayout, QLabel, QMainWindow, QSlider,
                               QVBoxLayout, QWidget)
 
 from src.analysis.direction import estimate_direction
-from src.analysis.features import compute_band_energy, compute_channel_energy
+from src.analysis.features import DEFAULT_BANDS, compute_band_energy, compute_channel_energy
 from src.analysis.noise_floor import NoiseFloorEstimator
 from src.analysis.onset import OnsetDetector
 from src.audio.capture import AudioCapture, AudioDeviceError, make_drop_on_full_queue
 from src.config_loader import AppConfig
 from src.tracking.smoother import ContactSmoother
-from src.types import AudioFrame, RadarContact
+from src.types import AudioFrame
 from src.ui.radar_widget import RadarWidget
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -55,11 +63,13 @@ class MainWindow(QMainWindow):
         root.addWidget(self._radar, stretch=1)
 
         # Sensitivity slider (0..100, default 50).
+        # HIGHER value = MORE sensitive = LOWER thresholds.
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("Sensitivity"))
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, 100)
         self._slider.setValue(50)
+        self._slider.setToolTip("0 = least sensitive (quiet rooms), 100 = most sensitive")
         self._slider.valueChanged.connect(self._on_sensitivity_changed)
         ctrl.addWidget(self._slider, stretch=1)
         self._status = QLabel("idle")
@@ -80,7 +90,7 @@ class MainWindow(QMainWindow):
             on_frame=self._on_frame_cb,
         )
 
-        # ---- Processing state (owned by processing thread) ----
+        # ---- Processing state ----
         n_channels = len(config.channel_layout_obj.names)
         self._noise_floor = NoiseFloorEstimator(
             n_channels=n_channels,
@@ -88,6 +98,7 @@ class MainWindow(QMainWindow):
             frame_size=config.audio.frame_size,
         )
         self._onset = OnsetDetector(
+            n_bands=len(DEFAULT_BANDS),
             flux_multiplier=config.onset.flux_multiplier,
             refractory_ms=config.onset.refractory_ms,
         )
@@ -96,12 +107,10 @@ class MainWindow(QMainWindow):
             angle_smoothing=config.tracking.angle_smoothing,
         )
 
-        # Live-tunable parameters (protected by a lock; processing thread
-        # reads a snapshot each frame).
+        # Locked snapshot of tunable parameters shared with the processing thread.
         self._params_lock = threading.Lock()
         self._params = {
-            "snr_threshold_db": config.direction.snr_threshold_db,
-            "flux_multiplier": config.onset.flux_multiplier,
+            "snr_threshold_db": float(config.direction.snr_threshold_db),
             "ignore_channels": (["C", "LFE"]
                                  if config.direction.ignore_center_channel else []),
         }
@@ -118,17 +127,24 @@ class MainWindow(QMainWindow):
     # ---- sensitivity slider ----------------------------------------------
 
     def _on_sensitivity_changed(self, value: int) -> None:
-        # Map slider 0..100 to sensitivity_factor 2.0..0.5 (higher slider
-        # value = more sensitive = lower thresholds).
+        # HIGHER slider value = MORE sensitive.
+        # Map slider 0..100 to sensitivity_factor 0.5..2.0 (higher = more sensitive).
+        # Effective threshold = base / factor -> higher factor -> lower threshold -> more sensitive.
         norm = value / 100.0
-        sensitivity_factor = 2.0 - 1.5 * norm   # 2.0 at 0, 0.5 at 100
+        sensitivity_factor = 0.5 + 1.5 * norm   # 0.5 at slider=0, 2.0 at slider=100
 
-        base_snr = self._config.direction.snr_threshold_db
-        base_flux = self._config.onset.flux_multiplier
+        base_snr = float(self._config.direction.snr_threshold_db)
+        base_flux = float(self._config.onset.flux_multiplier)
+        new_snr = max(1.0, base_snr / sensitivity_factor)
+        new_flux = max(0.5, base_flux / sensitivity_factor)
+
+        # Update SNR threshold via the locked snapshot (processing thread reads it).
         with self._params_lock:
-            self._params["snr_threshold_db"] = max(1.0, base_snr / sensitivity_factor)
-            self._params["flux_multiplier"] = max(0.5, base_flux / sensitivity_factor)
-            self._onset._flux_multiplier = self._params["flux_multiplier"]
+            self._params["snr_threshold_db"] = new_snr
+
+        # Update flux multiplier via the onset detector's own locked setter,
+        # respecting the concurrency contract (no direct attribute writes).
+        self._onset.set_flux_multiplier(new_flux)
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -136,6 +152,7 @@ class MainWindow(QMainWindow):
         try:
             self._capture.start()
         except AudioDeviceError as e:
+            logger.error("audio device error: %s", e)
             self._status.setText(f"device error: {e}")
             return
         self._proc_thread = threading.Thread(target=self._processing_loop,
@@ -144,13 +161,14 @@ class MainWindow(QMainWindow):
         ch = self._capture.actual_channels
         sr = self._capture.actual_sample_rate
         self._status.setText(f"running: {ch}ch @ {int(sr)}Hz")
+        logger.info("audio started: %sch @ %sHz", ch, sr)
 
     def closeEvent(self, event) -> None:
         self._closing = True
         try:
             self._capture.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("error stopping capture: %s", e)
         super().closeEvent(event)
 
     # ---- processing thread -----------------------------------------------
@@ -172,9 +190,9 @@ class MainWindow(QMainWindow):
             try:
                 contacts = self._process_one_frame(frame, layout, sample_rate)
                 self._push_contacts(contacts)
-            except Exception:
-                # Processing must never die; swallow and keep going.
-                pass
+            except Exception as e:
+                # Processing must never die; log and keep going.
+                logger.exception("error in processing loop: %s", e)
 
     def _process_one_frame(self, frame: AudioFrame, layout, sample_rate: int):
         # Snapshot of live params.
@@ -209,7 +227,6 @@ class MainWindow(QMainWindow):
 
     def _push_contacts(self, contacts) -> None:
         try:
-            # Drop oldest if full.
             try:
                 self._contact_queue.put_nowait(list(contacts))
             except queue.Full:
@@ -221,8 +238,8 @@ class MainWindow(QMainWindow):
                     self._contact_queue.put_nowait(list(contacts))
                 except queue.Full:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("error pushing contacts: %s", e)
 
     # ---- UI tick ---------------------------------------------------------
 
@@ -243,8 +260,3 @@ class MainWindow(QMainWindow):
 
         # Advance sweep animation.
         self._radar.advance_sweep(dt)
-
-        dropped = self._dropped()
-        if dropped > 0:
-            # Light-touch status update; avoid spamming.
-            pass

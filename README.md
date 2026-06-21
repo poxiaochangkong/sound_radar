@@ -1,5 +1,11 @@
 # Sound Radar
 
+> ⚠️ **Compliance notice**: This is an audio-analysis learning project. Using
+> sound-radar tools in some multiplayer competitive games may violate the
+> game's Terms of Service or trigger anti-cheat. **You are responsible for
+> verifying the rules of any game you use this with.** See
+> [`docs/07_safety_and_compliance.md`](docs/07_safety_and_compliance.md).
+
 A real-time acoustic source direction radar for FPS games.
 
 ## What it does
@@ -56,13 +62,15 @@ In the target game's audio settings:
     ::powershell
     python src/main.py
 
-Adjust the **Sensitivity** slider in the UI so that ambient noise does not trigger blips, but footsteps/gunshots do.
+Adjust the **Sensitivity** slider in the UI:
+- Drag **right** (higher) = **more sensitive** (picks up quieter / farther sounds)
+- Drag **left** (lower) = **less sensitive** (rejects ambient noise)
 
 ## Project layout
 
     sound_radar/
     ├── config.yaml              # default config (game-agnostic)
-    ├── docs/                    # design documents
+    ├── docs/                    # design documents + safety/compliance
     ├── src/
     │   ├── audio/               # multichannel loopback capture
     │   ├── analysis/            # features, onset detection, VBAP direction
